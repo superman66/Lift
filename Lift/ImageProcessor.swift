@@ -13,11 +13,24 @@ class ImageProcessor: ObservableObject {
         case failed(Error)
     }
     
+    /// 背景移除方式
+    enum BackgroundRemovalMethod: String, CaseIterable {
+        case removeBG = "RemoveBG API"
+        case vision = "Vision 框架"
+    }
+    
+    private let removeBGAPIKey = "vFjZkwirpj5wBZsFM85gpJRF"
+    private let removeBGAPIURL = "https://api.remove.bg/v1.0/removebg"
+    
     @Published var status: Status = .idle
+    @Published var removalMethod: BackgroundRemovalMethod = .removeBG
     
     // 主入口函数，处理拖入的图片
     func processImage(at url: URL) {
         self.status = .processing
+        
+        // 获取当前选择的方法（在进入 Task 之前捕获）
+        let method = self.removalMethod
         
         Task.detached(priority: .userInitiated) {
             do {
@@ -29,20 +42,29 @@ class ImageProcessor: ObservableObject {
                     }
                 }
                 
-                // 1. 加载图片 (在后台任务中访问 MainActor 隔离的 'self'，需要 await)
+                // 1. 加载图片数据
+                let imageData = try Data(contentsOf: url)
+                
+                // 2. 加载图片 (在后台任务中访问 MainActor 隔离的 'self'，需要 await)
                 guard let sourceImage = await self.loadImage(from: url) else {
                     throw NSError(domain: "ImageProcessor", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法加载图片"])
                 }
                 
-                // 2. 移除背景
-                let imageWithoutBackground = try await self.removeBackground(from: sourceImage)
+                // 3. 根据选择的方法移除背景
+                let imageWithoutBackground: CGImage
+                switch method {
+                case .removeBG:
+                    imageWithoutBackground = try await self.removeBackgroundWithRemoveBG(imageData: imageData)
+                case .vision:
+                    imageWithoutBackground = try await self.removeBackgroundWithVision(from: sourceImage)
+                }
                 
-                // 3. 裁切透明区域 (同样需要 await)
+                // 4. 裁切透明区域 (同样需要 await)
                 guard let trimmedImage = await self.trimTransparentPixels(from: imageWithoutBackground) else {
                     throw NSError(domain: "ImageProcessor", code: 2, userInfo: [NSLocalizedDescriptionKey: "裁切图片失败"])
                 }
                 
-                // 4. 转换为 NSImage 并更新UI（创建独立的图片副本，避免访问权限问题）
+                // 5. 转换为 NSImage 并更新UI（创建独立的图片副本，避免访问权限问题）
                 let originalNSImage = await self.createNSImage(from: sourceImage)
                 let processedNSImage = await self.createNSImage(from: trimmedImage)
                 
@@ -102,8 +124,78 @@ class ImageProcessor: ObservableObject {
         return image
     }
     
-    // 步骤 A: 使用 Vision 框架移除背景
-    private func removeBackground(from image: CGImage) async throws -> CGImage {
+    // MARK: - RemoveBG API 方法
+    
+    /// 使用 RemoveBG API 移除背景
+    private func removeBackgroundWithRemoveBG(imageData: Data) async throws -> CGImage {
+        guard let url = URL(string: removeBGAPIURL) else {
+            throw NSError(domain: "RemoveBG", code: 0, userInfo: [NSLocalizedDescriptionKey: "无效的 API URL"])
+        }
+        
+        // 创建 multipart/form-data 请求
+        let boundary = UUID().uuidString
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue(removeBGAPIKey, forHTTPHeaderField: "X-Api-Key")
+        
+        // 构建 multipart body
+        var body = Data()
+        
+        // 添加图片数据
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"image_file\"; filename=\"image.png\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: image/png\r\n\r\n".data(using: .utf8)!)
+        body.append(imageData)
+        body.append("\r\n".data(using: .utf8)!)
+        
+        // 添加结束边界
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        
+        request.httpBody = body
+        
+        // 发送请求
+        let (responseData, response) = try await URLSession.shared.data(for: request)
+        
+        // 检查响应状态
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NSError(domain: "RemoveBG", code: 1, userInfo: [NSLocalizedDescriptionKey: "无效的服务器响应"])
+        }
+        
+        if httpResponse.statusCode != 200 {
+            // 尝试解析错误信息
+            if let errorJson = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+               let errors = errorJson["errors"] as? [[String: Any]],
+               let firstError = errors.first,
+               let title = firstError["title"] as? String {
+                throw NSError(domain: "RemoveBG", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "RemoveBG API 错误: \(title)"])
+            }
+            throw NSError(domain: "RemoveBG", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "RemoveBG API 请求失败，状态码: \(httpResponse.statusCode)"])
+        }
+        
+        // 将响应数据转换为 CGImage
+        guard let dataProvider = CGDataProvider(data: responseData as CFData),
+              let cgImage = CGImage(pngDataProviderSource: dataProvider,
+                                    decode: nil,
+                                    shouldInterpolate: true,
+                                    intent: .defaultIntent) else {
+            // 尝试使用 NSImage 解析（支持更多格式）
+            guard let nsImage = NSImage(data: responseData),
+                  let tiffData = nsImage.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiffData),
+                  let resultCGImage = bitmap.cgImage else {
+                throw NSError(domain: "RemoveBG", code: 2, userInfo: [NSLocalizedDescriptionKey: "无法解析返回的图片数据"])
+            }
+            return resultCGImage
+        }
+        
+        return cgImage
+    }
+    
+    // MARK: - Vision 框架方法
+    
+    /// 使用 Vision 框架移除背景
+    private func removeBackgroundWithVision(from image: CGImage) async throws -> CGImage {
         let request = VNGenerateForegroundInstanceMaskRequest()
         let handler = VNImageRequestHandler(cgImage: image)
         

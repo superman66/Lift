@@ -9,7 +9,7 @@ struct ContentView: View {
             // 根据 ImageProcessor 的状态切换视图
             switch imageProcessor.status {
             case .idle:
-                DropZoneView(onDrop: handleDrop)
+                DropZoneView(onDrop: handleDrop, removalMethod: $imageProcessor.removalMethod)
             case .processing:
                 ProcessingView()
             case .finished(let original, let processed):
@@ -63,6 +63,7 @@ struct ContentView: View {
 // 拖放区域视图
 struct DropZoneView: View {
     var onDrop: (URL) -> Void
+    @Binding var removalMethod: ImageProcessor.BackgroundRemovalMethod
     
     @State private var isTargeted = false
     @State private var isFilePickerPresented = false
@@ -75,6 +76,15 @@ struct DropZoneView: View {
             
             Text("拖入图片自动去底 + 裁切")
                 .font(.headline)
+            
+            // 背景移除方式选择
+            Picker("移除方式", selection: $removalMethod) {
+                ForEach(ImageProcessor.BackgroundRemovalMethod.allCases, id: \.self) { method in
+                    Text(method.rawValue).tag(method)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 250)
             
             Text("或")
                 .font(.subheadline)
