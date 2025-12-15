@@ -12,13 +12,17 @@ struct ContentView: View {
                 DropZoneView(onDrop: handleDrop, removalMethod: $imageProcessor.removalMethod)
             case .processing:
                 ProcessingView()
-            case .finished(let original, let processed):
+            case .finished(let original, let processed, let currentIndex, let totalCount):
                 FinishedView(
                     originalImage: original,
                     processedImage: processed,
+                    currentIndex: currentIndex,
+                    totalCount: totalCount,
                     onSave: handleSave,
                     onCopy: handleCopy,
-                    onReset: reset
+                    onSkip: skipCurrent,
+                    onReset: reset,
+                    imageProcessor: imageProcessor
                 )
             case .failed(let error):
                 ErrorView(error: error, onReset: reset)
@@ -28,9 +32,9 @@ struct ContentView: View {
         .padding()
     }
     
-    // 处理文件拖放
-    private func handleDrop(url: URL) {
-        imageProcessor.processImage(at: url)
+    // 处理文件拖放（支持多文件）
+    private func handleDrop(urls: [URL]) {
+        imageProcessor.processImages(urls: urls)
     }
     
     // 处理保存操作
@@ -42,6 +46,9 @@ struct ContentView: View {
         
         if savePanel.runModal() == .OK, let url = savePanel.url {
             imageProcessor.saveImage(image, to: url)
+            // 保存后自动处理下一张（如果有的话）
+            imageProcessor.currentIndex += 1
+            imageProcessor.processNextImage()
         }
     }
     
@@ -50,11 +57,19 @@ struct ContentView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([image])
+        // 复制后自动处理下一张（如果有的话）
+        imageProcessor.currentIndex += 1
+        imageProcessor.processNextImage()
+    }
+    
+    // 跳过当前图片
+    private func skipCurrent() {
+        imageProcessor.skipCurrentImage()
     }
     
     // 重置视图状态
     private func reset() {
-        imageProcessor.status = .idle
+        imageProcessor.reset()
     }
 }
 
@@ -62,7 +77,7 @@ struct ContentView: View {
 
 // 拖放区域视图
 struct DropZoneView: View {
-    var onDrop: (URL) -> Void
+    var onDrop: ([URL]) -> Void
     @Binding var removalMethod: ImageProcessor.BackgroundRemovalMethod
     
     @State private var isTargeted = false
@@ -76,6 +91,10 @@ struct DropZoneView: View {
             
             Text("拖入图片自动去底 + 裁切")
                 .font(.headline)
+            
+            Text("支持单张或多张图片")
+                .font(.caption)
+                .foregroundColor(.secondary)
             
             // 背景移除方式选择
             Picker("移除方式", selection: $removalMethod) {
@@ -107,33 +126,46 @@ struct DropZoneView: View {
                 .foregroundColor(isTargeted ? .blue : .gray.opacity(0.5))
         )
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
-            if let provider = providers.first {
+            let group = DispatchGroup()
+            var urls: [URL] = []
+            
+            for provider in providers {
+                group.enter()
                 provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { (item, error) in
                     if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        DispatchQueue.main.async {
-                            onDrop(url)
-                        }
+                        urls.append(url)
                     }
+                    group.leave()
                 }
-                return true
             }
-            return false
+            
+            group.notify(queue: .main) {
+                if !urls.isEmpty {
+                    onDrop(urls)
+                }
+            }
+            
+            return true
         }
         .fileImporter(
             isPresented: $isFilePickerPresented,
             allowedContentTypes: [.image],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
             switch result {
             case .success(let urls):
-                if let url = urls.first {
-                    // 获取安全访问权限
+                var accessibleURLs: [URL] = []
+                for url in urls {
                     if url.startAccessingSecurityScopedResource() {
-                        defer { url.stopAccessingSecurityScopedResource() }
-                        onDrop(url)
+                        accessibleURLs.append(url)
+                        // 注意：这里不能立即调用 stopAccessingSecurityScopedResource
+                        // 需要在处理完成后调用
                     } else {
-                        onDrop(url)
+                        accessibleURLs.append(url)
                     }
+                }
+                if !accessibleURLs.isEmpty {
+                    onDrop(accessibleURLs)
                 }
             case .failure(let error):
                 print("选择文件失败: \(error.localizedDescription)")
@@ -159,12 +191,29 @@ struct ProcessingView: View {
 struct FinishedView: View {
     let originalImage: NSImage
     let processedImage: NSImage
+    let currentIndex: Int
+    let totalCount: Int
     let onSave: (NSImage) -> Void
     let onCopy: (NSImage) -> Void
+    let onSkip: () -> Void
     let onReset: () -> Void
+    @ObservedObject var imageProcessor: ImageProcessor
+    
+    @State private var isDropTargeted = false
     
     var body: some View {
         VStack {
+            // 批量处理进度显示
+            if totalCount > 1 {
+                HStack {
+                    Text("图片 \(currentIndex + 1)/\(totalCount)")
+                        .font(.headline)
+                        .foregroundColor(.blue)
+                    Spacer()
+                }
+                .padding(.horizontal)
+            }
+            
             HStack(spacing: 20) {
                 VStack {
                     Text("处理前")
@@ -184,16 +233,66 @@ struct FinishedView: View {
             }
             .padding()
             
-            HStack {
+            HStack(spacing: 12) {
                 Button(action: { onSave(processedImage) }) {
                     Label("保存图片", systemImage: "square.and.arrow.down")
                 }
+                .keyboardShortcut("s", modifiers: .command)
                 
                 Button(action: { onCopy(processedImage) }) {
                     Label("复制到剪贴板", systemImage: "doc.on.doc")
                 }
                 
+                // 批量处理时显示跳过按钮
+                if totalCount > 1 && currentIndex < totalCount - 1 {
+                    Button(action: onSkip) {
+                        Label("跳过", systemImage: "forward.fill")
+                    }
+                }
+                
                 Button("处理新图片", action: onReset)
+            }
+            .padding(.top, 8)
+            
+            // 批量处理时显示缩略图预览
+            if totalCount > 1 {
+                ThumbnailPreviewBar(
+                    results: imageProcessor.processedResults,
+                    currentIndex: currentIndex,
+                    totalCount: totalCount,
+                    onSelect: { index in
+                        imageProcessor.navigateToImage(at: index)
+                    }
+                )
+            }
+        }
+        .background(isDropTargeted ? Color.blue.opacity(0.1) : Color.clear)
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleDropInFinishedView(providers)
+            return true
+        }
+    }
+    
+    // 处理在结果页面的拖放
+    private func handleDropInFinishedView(_ providers: [NSItemProvider]) {
+        let group = DispatchGroup()
+        var urls: [URL] = []
+        
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { (item, error) in
+                if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    urls.append(url)
+                }
+                group.leave()
+            }
+        }
+        
+        group.notify(queue: .main) {
+            if !urls.isEmpty {
+                // 重置并开始新的处理流程
+                imageProcessor.reset()
+                imageProcessor.processImages(urls: urls)
             }
         }
     }
@@ -233,6 +332,87 @@ struct ErrorView: View {
                 .multilineTextAlignment(.center)
                 .padding()
             Button("重试", action: onReset)
+        }
+    }
+}
+
+// 缩略图预览栏
+struct ThumbnailPreviewBar: View {
+    let results: [(original: NSImage, processed: NSImage)]
+    let currentIndex: Int
+    let totalCount: Int
+    let onSelect: (Int) -> Void
+    
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(0..<totalCount, id: \.self) { index in
+                    ThumbnailView(
+                        image: index < results.count ? results[index].processed : nil,
+                        index: index,
+                        isSelected: index == currentIndex,
+                        onTap: { onSelect(index) }
+                    )
+                }
+            }
+            .padding(.horizontal)
+        }
+        .frame(height: 100)
+        .background(Color.gray.opacity(0.1))
+    }
+}
+
+// 单个缩略图视图
+struct ThumbnailView: View {
+    let image: NSImage?
+    let index: Int
+    let isSelected: Bool
+    let onTap: () -> Void
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            if let image = image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 60, height: 60)
+                    .background(checkerboardBackground)
+                    .cornerRadius(4)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(isSelected ? Color.blue : Color.clear, lineWidth: 3)
+                    )
+            } else {
+                // 未处理的图片显示占位符
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(width: 60, height: 60)
+                    ProgressView()
+                        .scaleEffect(0.7)
+                }
+            }
+            
+            Text("\(index + 1)")
+                .font(.caption2)
+                .foregroundColor(isSelected ? .blue : .secondary)
+        }
+        .onTapGesture(perform: onTap)
+    }
+    
+    // 创建一个棋盘格背景，用于展示透明效果
+    private var checkerboardBackground: some View {
+        Canvas { context, size in
+            let checkSize: CGFloat = 5
+            for y in stride(from: 0, to: size.height, by: checkSize) {
+                for x in stride(from: 0, to: size.width, by: checkSize) {
+                    let isLight = (Int(x/checkSize) + Int(y/checkSize)) % 2 == 0
+                    context.fill(
+                        Path(CGRect(x: x, y: y, width: checkSize, height: checkSize)),
+                        with: .color(isLight ? .white : Color(white: 0.9))
+                    )
+                }
+            }
         }
     }
 }

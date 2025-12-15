@@ -9,7 +9,7 @@ class ImageProcessor: ObservableObject {
     enum Status {
         case idle
         case processing
-        case finished(original: NSImage, processed: NSImage)
+        case finished(original: NSImage, processed: NSImage, currentIndex: Int, totalCount: Int)
         case failed(Error)
     }
     
@@ -24,6 +24,61 @@ class ImageProcessor: ObservableObject {
     
     @Published var status: Status = .idle
     @Published var removalMethod: BackgroundRemovalMethod = .removeBG
+    
+    // 批量处理支持
+    @Published var imageQueue: [URL] = []
+    @Published var currentIndex: Int = 0
+    @Published var totalCount: Int = 0
+    @Published var processedResults: [(original: NSImage, processed: NSImage)] = []
+    
+    // 批量处理入口函数
+    func processImages(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        self.imageQueue = urls
+        self.currentIndex = 0
+        self.totalCount = urls.count
+        processNextImage()
+    }
+    
+    // 处理队列中的下一张图片
+    func processNextImage() {
+        guard currentIndex < imageQueue.count else {
+            // 所有图片处理完成，重置状态
+            reset()
+            return
+        }
+        
+        let url = imageQueue[currentIndex]
+        processImage(at: url)
+    }
+    
+    // 跳过当前图片，处理下一张
+    func skipCurrentImage() {
+        currentIndex += 1
+        processNextImage()
+    }
+    
+    // 切换查看不同的处理结果
+    func navigateToImage(at index: Int) {
+        guard index >= 0 && index < processedResults.count else { return }
+        let result = processedResults[index]
+        currentIndex = index
+        status = .finished(
+            original: result.original,
+            processed: result.processed,
+            currentIndex: index,
+            totalCount: totalCount
+        )
+    }
+    
+    // 重置到初始状态
+    func reset() {
+        imageQueue = []
+        currentIndex = 0
+        totalCount = 0
+        processedResults = []
+        status = .idle
+    }
     
     // 主入口函数，处理拖入的图片
     func processImage(at url: URL) {
@@ -69,7 +124,20 @@ class ImageProcessor: ObservableObject {
                 let processedNSImage = await self.createNSImage(from: trimmedImage)
                 
                 await MainActor.run {
-                    self.status = .finished(original: originalNSImage, processed: processedNSImage)
+                    // 存储处理结果
+                    let result = (original: originalNSImage, processed: processedNSImage)
+                    if self.currentIndex < self.processedResults.count {
+                        self.processedResults[self.currentIndex] = result
+                    } else {
+                        self.processedResults.append(result)
+                    }
+                    
+                    self.status = .finished(
+                        original: originalNSImage,
+                        processed: processedNSImage,
+                        currentIndex: self.currentIndex,
+                        totalCount: self.totalCount
+                    )
                 }
                 
             } catch {
