@@ -6,6 +6,13 @@ import CoreImage.CIFilterBuiltins
 @MainActor
 class ImageProcessor: ObservableObject {
     
+    /// 处理结果结构体
+    struct ProcessedResult {
+        let original: NSImage
+        let processed: NSImage
+        let originalFileName: String
+    }
+    
     enum Status {
         case idle
         case processing
@@ -29,7 +36,7 @@ class ImageProcessor: ObservableObject {
     @Published var imageQueue: [URL] = []
     @Published var currentIndex: Int = 0
     @Published var totalCount: Int = 0
-    @Published var processedResults: [(original: NSImage, processed: NSImage)] = []
+    @Published var processedResults: [ProcessedResult] = []
     
     // 批量处理入口函数
     func processImages(urls: [URL]) {
@@ -84,6 +91,9 @@ class ImageProcessor: ObservableObject {
     func processImage(at url: URL) {
         self.status = .processing
         
+        // 提取原始文件名（不含扩展名）
+        let originalFileName = url.deletingPathExtension().lastPathComponent
+        
         // 获取当前选择的方法（在进入 Task 之前捕获）
         let method = self.removalMethod
         
@@ -125,7 +135,11 @@ class ImageProcessor: ObservableObject {
                 
                 await MainActor.run {
                     // 存储处理结果
-                    let result = (original: originalNSImage, processed: processedNSImage)
+                    let result = ProcessedResult(
+                        original: originalNSImage,
+                        processed: processedNSImage,
+                        originalFileName: originalFileName
+                    )
                     if self.currentIndex < self.processedResults.count {
                         self.processedResults[self.currentIndex] = result
                     } else {

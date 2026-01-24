@@ -38,11 +38,11 @@ struct ContentView: View {
     }
     
     // 处理保存操作
-    private func handleSave(image: NSImage) {
+    private func handleSave(image: NSImage, fileName: String) {
         let savePanel = NSSavePanel()
         savePanel.allowedContentTypes = [.png]
         savePanel.canCreateDirectories = true
-        savePanel.nameFieldStringValue = "processed_image.png"
+        savePanel.nameFieldStringValue = "\(fileName).png"
         
         if savePanel.runModal() == .OK, let url = savePanel.url {
             imageProcessor.saveImage(image, to: url)
@@ -193,7 +193,7 @@ struct FinishedView: View {
     let processedImage: NSImage
     let currentIndex: Int
     let totalCount: Int
-    let onSave: (NSImage) -> Void
+    let onSave: (NSImage, String) -> Void
     let onCopy: (NSImage) -> Void
     let onSkip: () -> Void
     let onReset: () -> Void
@@ -234,7 +234,10 @@ struct FinishedView: View {
             .padding()
             
             HStack(spacing: 12) {
-                Button(action: { onSave(processedImage) }) {
+                Button(action: {
+                    let fileName = imageProcessor.processedResults[currentIndex].originalFileName
+                    onSave(processedImage, fileName)
+                }) {
                     Label("保存图片", systemImage: "square.and.arrow.down")
                 }
                 .keyboardShortcut("s", modifiers: .command)
@@ -338,7 +341,7 @@ struct ErrorView: View {
 
 // 缩略图预览栏
 struct ThumbnailPreviewBar: View {
-    let results: [(original: NSImage, processed: NSImage)]
+    let results: [ImageProcessor.ProcessedResult]
     let currentIndex: Int
     let totalCount: Int
     let onSelect: (Int) -> Void
