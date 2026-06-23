@@ -24,6 +24,8 @@ class ImageProcessor: ObservableObject {
     enum BackgroundRemovalMethod: String, CaseIterable {
         case removeBG = "RemoveBG API"
         case vision = "Vision 框架"
+        case metadataOnly = "仅清除元数据"
+        case watermarkRemoval = "去水印 (CLI)"
     }
     
     private let removeBGAPIKey = "vFjZkwirpj5wBZsFM85gpJRF"
@@ -116,22 +118,31 @@ class ImageProcessor: ObservableObject {
                 }
                 
                 // 3. 根据选择的方法移除背景
-                let imageWithoutBackground: CGImage
+                let finalImage: CGImage
                 switch method {
                 case .removeBG:
-                    imageWithoutBackground = try await self.removeBackgroundWithRemoveBG(imageData: imageData)
+                    let imageWithoutBackground = try await self.removeBackgroundWithRemoveBG(imageData: imageData)
+                    guard let trimmedImage = await self.trimTransparentPixels(from: imageWithoutBackground) else {
+                        throw NSError(domain: "ImageProcessor", code: 2, userInfo: [NSLocalizedDescriptionKey: "裁切图片失败"])
+                    }
+                    finalImage = trimmedImage
                 case .vision:
-                    imageWithoutBackground = try await self.removeBackgroundWithVision(from: sourceImage)
-                }
-                
-                // 4. 裁切透明区域 (同样需要 await)
-                guard let trimmedImage = await self.trimTransparentPixels(from: imageWithoutBackground) else {
-                    throw NSError(domain: "ImageProcessor", code: 2, userInfo: [NSLocalizedDescriptionKey: "裁切图片失败"])
+                    let imageWithoutBackground = try await self.removeBackgroundWithVision(from: sourceImage)
+                    guard let trimmedImage = await self.trimTransparentPixels(from: imageWithoutBackground) else {
+                        throw NSError(domain: "ImageProcessor", code: 2, userInfo: [NSLocalizedDescriptionKey: "裁切图片失败"])
+                    }
+                    finalImage = trimmedImage
+                case .metadataOnly:
+                    // 仅重新编码像素数据，不做背景移除/裁切，借此清除 EXIF/XMP/IPTC/C2PA 等元数据
+                    finalImage = sourceImage
+                case .watermarkRemoval:
+                    // 调用本机安装的 remove-ai-watermarks CLI，去除可见/不可见水印并清理元数据
+                    finalImage = try await self.removeWatermarksWithCLI(sourceURL: url)
                 }
                 
                 // 5. 转换为 NSImage 并更新UI（创建独立的图片副本，避免访问权限问题）
                 let originalNSImage = await self.createNSImage(from: sourceImage)
-                let processedNSImage = await self.createNSImage(from: trimmedImage)
+                let processedNSImage = await self.createNSImage(from: finalImage)
                 
                 await MainActor.run {
                     // 存储处理结果
@@ -378,7 +389,75 @@ class ImageProcessor: ObservableObject {
         
         return image.cropping(to: cropRect)
     }
-    
+
+    // MARK: - remove-ai-watermarks CLI 集成
+
+    /// 查找本机已安装的 remove-ai-watermarks 可执行文件
+    private func locateWatermarkCLI() -> URL? {
+        let candidatePaths = [
+            "/opt/homebrew/bin/remove-ai-watermarks",
+            "/usr/local/bin/remove-ai-watermarks"
+        ]
+        for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    /// 调用 remove-ai-watermarks CLI 的 `all` 子命令：依次去除可见水印、不可见水印，并清除 AI 生成元数据
+    private func removeWatermarksWithCLI(sourceURL: URL) async throws -> CGImage {
+        guard let cli = locateWatermarkCLI() else {
+            throw NSError(domain: "WatermarkCLI", code: 0, userInfo: [
+                NSLocalizedDescriptionKey: "未找到 remove-ai-watermarks，请先执行 `brew install remove-ai-watermarks`"
+            ])
+        }
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".png")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        let process = Process()
+        process.executableURL = cli
+        process.arguments = ["all", sourceURL.path, "-o", outputURL.path]
+
+        // CLI 把进度/警告信息打到 stdout，把用法/参数错误打到 stderr，两个都要采集
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        let stdoutText = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderrText = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // CLI 的退出码不是单纯的成功/失败标志：0 = 全部清除干净；1 = 已生成输出文件，但有未能处理的
+        // 部分（例如本机没装 GPU 依赖，跳过了不可见水印步骤）；其他非零码（如 2）才是真正的失败（未生成文件）。
+        // 因此用输出文件是否存在作为成败的依据，而不是单看退出码。
+        guard FileManager.default.fileExists(atPath: outputURL.path) else {
+            let errText = !stderrText.isEmpty ? stderrText : stdoutText
+            throw NSError(domain: "WatermarkCLI", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: "去水印失败: \(errText.isEmpty ? "未知错误" : errText)"
+            ])
+        }
+
+        if process.terminationStatus != 0, !stdoutText.isEmpty {
+            print("remove-ai-watermarks 警告:\n\(stdoutText)")
+        }
+
+        guard let outSource = CGImageSourceCreateWithURL(outputURL as CFURL, nil),
+              let outImage = CGImageSourceCreateImageAtIndex(outSource, 0, nil) else {
+            throw NSError(domain: "WatermarkCLI", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "无法读取去水印后的图片"
+            ])
+        }
+
+        return outImage
+    }
+
     // 将 NSImage 保存到文件
     func saveImage(_ image: NSImage, to url: URL) {
         // 使用 tiffRepresentation 和 NSBitmapImageRep 来安全地获取 CGImage

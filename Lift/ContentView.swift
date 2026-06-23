@@ -89,7 +89,7 @@ struct DropZoneView: View {
                 .font(.largeTitle)
                 .padding(.bottom, 8)
             
-            Text("拖入图片自动去底 + 裁切")
+            Text("拖入图片自动去底/清除元数据")
                 .font(.headline)
             
             Text("支持单张或多张图片")
@@ -103,7 +103,7 @@ struct DropZoneView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(maxWidth: 250)
+            .frame(maxWidth: 420)
             
             Text("或")
                 .font(.subheadline)

@@ -24,6 +24,7 @@ function show_help() {
     echo "  release  - 构建 Release 版本 (默认)"
     echo "  clean    - 清理构建产物"
     echo "  run      - 构建并运行 Release 版本"
+    echo "  install  - 构建并安装到 /Applications/Lift.app"
     echo "  test     - 运行测试"
     echo "  help     - 显示此帮助信息"
     echo ""
@@ -61,6 +62,26 @@ function run_app() {
     open "$BUILD_DIR/Lift.app"
 }
 
+function install_app() {
+    echo -e "${BLUE}🚀 构建 Release 版本...${NC}"
+    xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release clean build
+
+    BUILD_DIR=$(xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -showBuildSettings | grep -m 1 "BUILT_PRODUCTS_DIR" | sed 's/.*= //')
+
+    echo -e "${BLUE}🛑 退出正在运行的 Lift...${NC}"
+    osascript -e 'quit app "Lift"' >/dev/null 2>&1 || true
+    pkill -x Lift >/dev/null 2>&1 || true
+    sleep 1
+
+    echo -e "${BLUE}📦 安装到 /Applications/Lift.app...${NC}"
+    rm -rf /Applications/Lift.app
+    cp -R "$BUILD_DIR/Lift.app" /Applications/Lift.app
+    xattr -dr com.apple.quarantine /Applications/Lift.app
+
+    echo -e "${GREEN}✅ 安装完成: /Applications/Lift.app${NC}"
+    open /Applications/Lift.app
+}
+
 function run_tests() {
     echo -e "${BLUE}🧪 运行测试...${NC}"
     xcodebuild -project "$PROJECT" -scheme "$SCHEME" -destination 'platform=macOS' test
@@ -80,6 +101,9 @@ case "${1:-release}" in
         ;;
     run)
         run_app
+        ;;
+    install)
+        install_app
         ;;
     test)
         run_tests
